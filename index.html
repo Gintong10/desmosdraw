@@ -1,0 +1,95 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Desmos Draw — Image to Equations</title>
+<link rel="icon" href="data:,">
+  <script type="module" crossorigin src="/desmosdraw/assets/index-Cjj0mdLq.js"></script>
+  <link rel="stylesheet" crossorigin href="/desmosdraw/assets/index-DZIu_s5i.css">
+</head>
+<body>
+
+<div id="calculator"></div>
+
+<div class="overlay corner-top">
+  <input type="file" id="fileInput" accept="image/*" hidden>
+  <button id="uploadBtn" class="pill-btn">
+    <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg>
+    Upload Image
+  </button>
+  <button id="settingsBtn" class="icon-btn" title="Settings">
+    <svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
+  </button>
+
+  <div id="settingsPanel" class="settings-panel hidden">
+    <div class="settings-title">Drawing Detail</div>
+    <input type="range" id="detailSlider" min="0" max="2" step="1" value="1">
+    <div class="detail-labels"><span>Simple</span><span>Balanced</span><span>Detail</span></div>
+    <label class="settings-check" for="removeBgCheck" title="Remove background in your browser (first run downloads a model)">
+      <input type="checkbox" id="removeBgCheck" checked>
+      <span>Remove background</span>
+    </label>
+    <label class="settings-check" for="ghostImageCheck" title="Show a faint copy of the image behind the equations">
+      <input type="checkbox" id="ghostImageCheck" checked>
+      <span>Ghost image behind</span>
+    </label>
+  </div>
+</div>
+
+<div id="statusText" class="status-text hidden"></div>
+
+<div id="modelLoadingOverlay" class="model-loading-overlay hidden" aria-hidden="true">
+  <div class="model-loading-panel">
+    <div class="model-loading-label" id="modelLoadingLabel">Downloading cutout model…</div>
+    <div class="model-loading-track">
+      <div class="model-loading-bar" id="modelLoadingBar"></div>
+    </div>
+    <div class="model-loading-pct" id="modelLoadingPct">0%</div>
+  </div>
+</div>
+
+<div id="dropHint" class="drop-hint">
+  <svg viewBox="0 0 24 24" width="34" height="34" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg>
+  <div>Upload an image to draw it with equations</div>
+</div>
+
+<div class="video-controls hidden" id="videoControls">
+  <div class="scrub-row">
+    <span class="time-label" id="timeCurrent">0:00</span>
+    <input type="range" id="scrubBar" min="0" max="1000" step="0.1" value="0">
+    <span class="time-label" id="timeTotal">0:00</span>
+  </div>
+  <div class="btn-row">
+    <button id="back5Btn" class="ctrl-btn" title="Back 5 seconds">
+      <svg viewBox="0 0 24 24" width="18" height="18" fill="currentColor"><path d="M12 5V1L7 6l5 5V7c3.31 0 6 2.69 6 6s-2.69 6-6 6-6-2.69-6-6H4c0 4.42 3.58 8 8 8s8-3.58 8-8-3.58-8-8-8z"/></svg>
+      <span class="ctrl-badge">5</span>
+    </button>
+    <button id="playBtn" class="ctrl-btn play-btn" title="Play / Pause">
+      <svg id="playIcon" viewBox="0 0 24 24" width="20" height="20" fill="currentColor"><path d="M8 5v14l11-7z"/></svg>
+      <svg id="pauseIcon" viewBox="0 0 24 24" width="20" height="20" fill="currentColor" style="display:none"><path d="M6 5h4v14H6zM14 5h4v14h-4z"/></svg>
+    </button>
+    <button id="fwd5Btn" class="ctrl-btn" title="Forward 5 seconds">
+      <svg viewBox="0 0 24 24" width="18" height="18" fill="currentColor" style="transform:scaleX(-1)"><path d="M12 5V1L7 6l5 5V7c3.31 0 6 2.69 6 6s-2.69 6-6 6-6-2.69-6-6H4c0 4.42 3.58 8 8 8s8-3.58 8-8-3.58-8-8-8z"/></svg>
+      <span class="ctrl-badge">5</span>
+    </button>
+
+    <div class="spacer"></div>
+
+    <div class="speed-wrap">
+      <button id="speedBtn" class="ctrl-btn speed-btn" title="Playback speed">1×</button>
+      <div id="speedMenu" class="speed-menu hidden">
+        <button data-speed="0.25">0.25×</button>
+        <button data-speed="0.5">0.5×</button>
+        <button data-speed="1" class="active">1×</button>
+        <button data-speed="1.5">1.5×</button>
+        <button data-speed="2">2×</button>
+        <button data-speed="4">4×</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script src="https://www.desmos.com/api/v1.10/calculator.js?apiKey=dcb31709b452b1cf9dc26972add0fda6"></script>
+</body>
+</html>
