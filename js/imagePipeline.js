@@ -5,12 +5,17 @@
  *
  * Pipeline (cutout / BG-removal path):
  *   1) Optional in-browser AI cutout (@imgly/background-removal)
- *   2) XDoG + color-dodge stroke score inside the subject
- *   3) Threshold → close gaps → drop tiny blobs → Zhang–Suen thin
- *   4) Skeleton neighbor segments → chain → RDP → budget
+ *   2) Rasterize at the working resolution, supersampling small inputs
+ *   3) XDoG + color-dodge stroke score inside the subject
+ *   4) Hysteresis threshold → drop tiny blobs → Zhang–Suen thin
+ *   5) Skeleton neighbor segments → chain → bridge gaps → smooth → RDP → budget
  *
  * Isolines are avoided here: they turn soft anime shading into concentric
  * "topo" blobs. Thinning collapses real ink strokes to 1px centerlines.
+ *
+ * The ink mask is deliberately never dilated. Line art has strokes only a few
+ * pixels apart, so any closing fuses them into a solid mass whose skeleton
+ * traces the gaps between strokes rather than the strokes themselves.
  */
 export const ImagePipeline = (function () {
 
@@ -30,15 +35,22 @@ export const ImagePipeline = (function () {
     });
   }
 
-  function drawToCanvas(img, maxDim) {
+  /**
+   * Rasterize at the working resolution. Small inputs are supersampled (capped
+   * by maxUpscale): a 1px anime ink line has no room for a stroke centerline,
+   * so tracing a thumbnail at native size loses eyes, lashes and folds.
+   */
+  function drawToCanvas(img, maxDim, maxUpscale) {
     const longest = Math.max(img.width, img.height) || 1;
-    const scale = Math.min(1, maxDim / longest);
+    const scale = Math.min(maxDim / longest, maxUpscale == null ? 2.5 : maxUpscale);
     const w = Math.max(2, Math.round(img.width * scale));
     const h = Math.max(2, Math.round(img.height * scale));
     const canvas = document.createElement('canvas');
     canvas.width = w;
     canvas.height = h;
     const ctx = canvas.getContext('2d', { willReadFrequently: true });
+    ctx.imageSmoothingEnabled = true;
+    ctx.imageSmoothingQuality = 'high';
     // Transparent clear so cutout alpha is preserved in getImageData.
     ctx.clearRect(0, 0, w, h);
     ctx.drawImage(img, 0, 0, w, h);
@@ -256,17 +268,30 @@ export const ImagePipeline = (function () {
     }
   }
 
-  function percentileValue(field, p, mask) {
-    const vals = [];
-    if (mask) {
-      for (let i = 0; i < field.length; i++) if (mask[i]) vals.push(field[i]);
-    } else {
-      for (let i = 0; i < field.length; i++) vals.push(field[i]);
+  // Sorted copy of the masked population. Typed-array sort avoids boxing every
+  // sample, which matters now that the working canvas can exceed a megapixel.
+  function sortedSamples(field, mask, skipZeros) {
+    const buf = new Float32Array(field.length);
+    let n = 0;
+    for (let i = 0; i < field.length; i++) {
+      if (mask && !mask[i]) continue;
+      const v = field[i];
+      if (skipZeros && v <= 0) continue;
+      buf[n++] = v;
     }
-    if (!vals.length) return 0;
-    vals.sort((a, b) => a - b);
-    const idx = Math.min(vals.length - 1, Math.max(0, Math.floor(p * (vals.length - 1))));
-    return vals[idx];
+    const vals = buf.subarray(0, n);
+    vals.sort();
+    return vals;
+  }
+
+  function percentileOf(sorted, p) {
+    if (!sorted.length) return 0;
+    const idx = Math.min(sorted.length - 1, Math.max(0, Math.floor(p * (sorted.length - 1))));
+    return sorted[idx];
+  }
+
+  function percentileValue(field, p, mask) {
+    return percentileOf(sortedSamples(field, mask, false), p);
   }
 
   function contrastStretch(gray, loP, hiP, mask) {
@@ -467,26 +492,35 @@ export const ImagePipeline = (function () {
   }
 
   // Stroke score: edge-like DoG + dodge ink (not filled dark regions).
-  function strokeScore(gray, w, h, fg, inkBlur) {
-    const edges = xdogEdges(gray, w, h, 1.0, 1.6, 0.98);
+  // Also returns the 99th-percentile stroke strength, which is what the ink
+  // thresholds are expressed against (see inkThresholds).
+  function strokeScore(gray, w, h, fg, inkBlur, sigma) {
+    const edges = xdogEdges(gray, w, h, sigma == null ? 1.0 : sigma, 1.6, 0.98);
     const ink = dodgeInk(gray, w, h, inkBlur == null ? 2 : inkBlur);
     const score = new Float32Array(gray.length);
-    let p99 = 0;
-    const vals = [];
-    for (let i = 0; i < gray.length; i++) {
-      if (!fg[i]) continue;
-      vals.push(edges[i]);
-    }
-    if (vals.length) {
-      vals.sort((a, b) => a - b);
-      p99 = vals[Math.min(vals.length - 1, Math.floor(vals.length * 0.99))] || 1;
-    }
-    const inv = 255 / Math.max(1e-3, p99);
+    const edgeP99 = percentileOf(sortedSamples(edges, fg, false), 0.99) || 1;
+    const inv = 255 / Math.max(1e-3, edgeP99);
     for (let i = 0; i < gray.length; i++) {
       if (!fg[i]) { score[i] = 0; continue; }
       score[i] = 0.7 * Math.min(255, edges[i] * inv) + 0.3 * ink[i];
     }
-    return score;
+    return { score, p99: percentileOf(sortedSamples(score, fg, false), 0.99) || 1 };
+  }
+
+  /**
+   * Ink thresholds as fractions of the strongest stroke response.
+   *
+   * These used to be percentiles of the score across the whole subject, which
+   * does not work: over half of a typical subject is flat colour scoring
+   * exactly 0, so every percentile below ~0.75 collapsed onto the same value
+   * and `strokeLowP` had no effect at all. It also made the knobs wildly
+   * non-linear (p0.84 and p0.88 differed by 2x on real art). Scaling against
+   * p99 instead is independent of how much empty area the subject happens to
+   * have, so the same preset behaves consistently across images.
+   */
+  function inkThresholds(p99, hiFrac, loFrac) {
+    const hi = Math.max(1, hiFrac * p99);
+    return { hi, lo: Math.max(0.5, Math.min(hi * 0.9, loFrac * p99)) };
   }
 
   function thresholdMask(score, fg, percentile) {
@@ -499,9 +533,7 @@ export const ImagePipeline = (function () {
   }
 
   // Keep strong strokes + weak ink that touches them (closes hairline gaps).
-  function hysteresisMask(score, fg, w, h, highP, lowP) {
-    const hi = Math.max(10, percentileValue(score, highP, fg));
-    const lo = Math.max(4, Math.min(hi * 0.6, percentileValue(score, lowP, fg)));
+  function hysteresisMask(score, fg, w, h, hi, lo) {
     const n = w * h;
     const out = new Uint8Array(n);
     const weak = new Uint8Array(n);
@@ -609,42 +641,69 @@ export const ImagePipeline = (function () {
     return out;
   }
 
-  // Join open polylines whose endpoints nearly touch.
+  /**
+   * Join open polylines whose endpoints nearly touch.
+   *
+   * Endpoints go into a grid of maxDist-sized cells so each polyline only tests
+   * the 9 neighbouring cells. The previous version rescanned all pairs from the
+   * start after every single merge, which on a skeleton of ~1000 fragments cost
+   * hundreds of millions of distance checks and dominated total runtime.
+   */
   function mergeNearbyPolylines(polylines, maxDist) {
     maxDist = maxDist == null ? 3.5 : maxDist;
-    const polys = polylines.map((p) => p.slice());
+    const polys = polylines.filter((p) => p && p.length >= 2).map((p) => p.slice());
+    const cell = Math.max(1, maxDist);
+    const cellKey = (pt) => Math.floor(pt.x / cell) + ',' + Math.floor(pt.y / cell);
+
     let merged = true;
     while (merged) {
       merged = false;
+      const grid = new Map();
+      for (let i = 0; i < polys.length; i++) {
+        if (!polys[i]) continue;
+        for (const end of [0, -1]) {
+          const pt = end === 0 ? polys[i][0] : polys[i][polys[i].length - 1];
+          const k = cellKey(pt);
+          if (!grid.has(k)) grid.set(k, []);
+          grid.get(k).push({ i, end });
+        }
+      }
+
       for (let i = 0; i < polys.length; i++) {
         const a = polys[i];
         if (!a || a.length < 2) continue;
-        const aEnds = [a[0], a[a.length - 1]];
-        for (let j = i + 1; j < polys.length; j++) {
-          const b = polys[j];
-          if (!b || b.length < 2) continue;
-          const bEnds = [b[0], b[b.length - 1]];
-          let best = null;
-          for (let ae = 0; ae < 2; ae++) {
-            for (let be = 0; be < 2; be++) {
-              const d = Math.hypot(aEnds[ae].x - bEnds[be].x, aEnds[ae].y - bEnds[be].y);
-              if (d <= maxDist && (!best || d < best.d)) best = { ae, be, d };
+        let best = null;
+        for (const ae of [0, -1]) {
+          const ap = ae === 0 ? a[0] : a[a.length - 1];
+          const gx = Math.floor(ap.x / cell);
+          const gy = Math.floor(ap.y / cell);
+          for (let ox = -1; ox <= 1; ox++) {
+            for (let oy = -1; oy <= 1; oy++) {
+              const bucket = grid.get((gx + ox) + ',' + (gy + oy));
+              if (!bucket) continue;
+              for (const cand of bucket) {
+                if (cand.i === i) continue;
+                const b = polys[cand.i];
+                if (!b || b.length < 2) continue;
+                const bp = cand.end === 0 ? b[0] : b[b.length - 1];
+                const d = Math.hypot(ap.x - bp.x, ap.y - bp.y);
+                if (d <= maxDist && (!best || d < best.d)) {
+                  best = { ae, j: cand.i, be: cand.end, d };
+                }
+              }
             }
           }
-          if (!best) continue;
-          let left = a, right = b;
-          // Orient so we append right onto left.
-          if (best.ae === 0) left = a.slice().reverse();
-          if (best.be === 1) right = b.slice().reverse();
-          const joined = left.concat(right.slice(1));
-          polys[i] = joined;
-          polys[j] = null;
-          merged = true;
-          break;
         }
-        if (merged) break;
+        if (!best) continue;
+        // Orient so we append right onto left.
+        const left = best.ae === 0 ? a.slice().reverse() : a;
+        const bPoly = polys[best.j];
+        const right = best.be === -1 ? bPoly.slice().reverse() : bPoly;
+        polys[i] = left.concat(right.slice(1));
+        polys[best.j] = null;
+        merged = true;
+        break;
       }
-      // compact
       if (merged) {
         for (let k = polys.length - 1; k >= 0; k--) if (!polys[k]) polys.splice(k, 1);
       }
@@ -895,6 +954,57 @@ export const ImagePipeline = (function () {
     return rdp(points);
   }
 
+  /**
+   * Gaussian blur along the polyline's own ordering.
+   *
+   * A pixel skeleton can only step in 8 directions, so every diagonal stroke
+   * arrives as a staircase. RDP preserves those steps as hard corners, which is
+   * what makes raw traces look jittery. Smoothing first both fixes that and
+   * lowers the final point count, because RDP then finds fewer real corners.
+   */
+  function smoothPolyline(points, sigma) {
+    const n = points.length;
+    if (!sigma || sigma <= 0 || n < 5) return points;
+
+    const radius = Math.max(1, Math.ceil(sigma * 2.5));
+    const kernel = new Float64Array(radius * 2 + 1);
+    let sum = 0;
+    for (let k = -radius; k <= radius; k++) {
+      const v = Math.exp(-(k * k) / (2 * sigma * sigma));
+      kernel[k + radius] = v;
+      sum += v;
+    }
+    for (let k = 0; k < kernel.length; k++) kernel[k] /= sum;
+
+    // Closed loops wrap around; open strokes clamp and keep their endpoints.
+    const closed = Math.hypot(points[0].x - points[n - 1].x, points[0].y - points[n - 1].y) <= 1.5;
+    const src = closed ? points.slice(0, n - 1) : points;
+    const m = src.length;
+    const out = new Array(m);
+    for (let i = 0; i < m; i++) {
+      let sx = 0, sy = 0;
+      for (let k = -radius; k <= radius; k++) {
+        let j = i + k;
+        if (closed) {
+          j = ((j % m) + m) % m;
+        } else {
+          j = Math.max(0, Math.min(m - 1, j));
+        }
+        const wgt = kernel[k + radius];
+        sx += src[j].x * wgt;
+        sy += src[j].y * wgt;
+      }
+      out[i] = { x: sx, y: sy };
+    }
+    if (closed) {
+      out.push({ x: out[0].x, y: out[0].y });
+    } else {
+      out[0] = points[0];
+      out[m - 1] = points[n - 1];
+    }
+    return out;
+  }
+
   function polylineLength(points) {
     let len = 0;
     for (let i = 1; i < points.length; i++) {
@@ -908,61 +1018,77 @@ export const ImagePipeline = (function () {
     return Math.hypot(a.x - b.x, a.y - b.y) <= tol;
   }
 
-  // Simple / Balanced / Detail — stroke threshold & budget (not isolines).
-  // strokePercentile: higher → fewer, stronger lines only.
-  // smallLoop must stay modest — eyes/headphones are closed loops.
+  // Thumbnails get supersampled up to this factor so 1px ink lines have room
+  // for a centerline. Higher than ~2.5x only interpolates detail that is not
+  // in the source, at real CPU cost.
+  const MAX_UPSCALE = 2.5;
+
+  /**
+   * Simple / Balanced / Detail.
+   *
+   * strokeHiFrac / strokeLoFrac are fractions of the p99 stroke response (see
+   * inkThresholds). strokeLoFrac is the stronger knob: it sets how faint an ink
+   * trace may be and still be kept when it connects to a confident stroke.
+   *
+   * Radii marked "@400" are in pixels at a 400px-longest-side reference and are
+   * multiplied by resScale for the actual working size, so a preset produces
+   * the same look regardless of input resolution.
+   */
   const DETAIL_PRESETS = [
     {
-      maxDim: 320,
-      strokeHighP: 0.88,
-      strokeLowP: 0.72,
-      inkBlur: 2,
-      bridgeDist: 5,
-      mergeDist: 4,
-      minComponentFactor: 0.00018,
+      maxDim: 600,
+      strokeHiFrac: 0.20,
+      strokeLoFrac: 0.045,
+      inkBlur: 2,        // @400
+      bridgeDist: 4,     // @400
+      mergeDist: 3,      // @400
+      smoothSigma: 1.3,  // @400
+      epsilon: 0.45,     // @400
+      minComponentFactor: 0.00008,
       includeSilhouette: true,
-      epsilon: 1.45,
-      minLenFactor: 0.022,
-      smallLoopFactor: 0.07,
-      maxContours: 80,
-      maxTotalPoints: 3200,
-      minFgCoverage: 0.3,
+      minLenFactor: 0.010,
+      smallLoopFactor: 0.018,
+      maxContours: 260,
+      maxTotalPoints: 5000,
+      minFgCoverage: 0.15,
       internalLevels: [0.38, 0.58],
       structBlur: 2,
     },
     {
-      maxDim: 400,
-      strokeHighP: 0.84,
-      strokeLowP: 0.66,
+      maxDim: 800,
+      strokeHiFrac: 0.14,
+      strokeLoFrac: 0.018,
       inkBlur: 2,
-      bridgeDist: 6,
-      mergeDist: 4.5,
-      minComponentFactor: 0.00012,
+      bridgeDist: 4,
+      mergeDist: 3,
+      smoothSigma: 1.0,
+      epsilon: 0.30,
+      minComponentFactor: 0.00004,
       includeSilhouette: true,
-      epsilon: 1.15,
-      minLenFactor: 0.016,
-      smallLoopFactor: 0.055,
-      maxContours: 160,
-      maxTotalPoints: 6000,
-      minFgCoverage: 0.25,
+      minLenFactor: 0.006,
+      smallLoopFactor: 0.010,
+      maxContours: 400,
+      maxTotalPoints: 9000,
+      minFgCoverage: 0.15,
       internalLevels: [0.32, 0.48, 0.64],
       structBlur: 2,
     },
     {
-      maxDim: 480,
-      strokeHighP: 0.80,
-      strokeLowP: 0.60,
+      maxDim: 1000,
+      strokeHiFrac: 0.10,
+      strokeLoFrac: 0.012,
       inkBlur: 2,
-      bridgeDist: 7,
-      mergeDist: 5,
-      minComponentFactor: 0.00008,
+      bridgeDist: 4,
+      mergeDist: 3,
+      smoothSigma: 0.9,
+      epsilon: 0.24,
+      minComponentFactor: 0.00003,
       includeSilhouette: true,
-      epsilon: 0.95,
-      minLenFactor: 0.012,
-      smallLoopFactor: 0.045,
-      maxContours: 220,
-      maxTotalPoints: 9000,
-      minFgCoverage: 0.2,
+      minLenFactor: 0.004,
+      smallLoopFactor: 0.008,
+      maxContours: 600,
+      maxTotalPoints: 14000,
+      minFgCoverage: 0.15,
       internalLevels: [0.28, 0.42, 0.56, 0.7],
       structBlur: 1,
     },
@@ -1004,7 +1130,10 @@ export const ImagePipeline = (function () {
     for (let i = 0; i < polylines.length; i++) {
       const simplified = simplifyRDP(polylines[i], preset.epsilon);
       const len = polylineLength(simplified);
-      if (simplified.length < 4 || len < minLen) continue;
+      // A straight stroke simplifies to 2 points and is still a real line —
+      // eyelashes, nostrils, lip lines and cloth folds all land here. Requiring
+      // 4 points was rejecting ~40% of everything traced.
+      if (simplified.length < 2 || len < minLen) continue;
       if (isClosed(simplified, 3) && len < smallLoop) continue;
       if (requireFg && contourFgCoverage(simplified, fg, w, h) < preset.minFgCoverage) continue;
       scored.push({ score: len, points: simplified });
@@ -1046,7 +1175,10 @@ export const ImagePipeline = (function () {
     const img = await loadImage(source);
 
     report('Analyzing pixels…');
-    const { w, h, imageData, canvas } = drawToCanvas(img, preset.maxDim);
+    const { w, h, imageData, canvas } = drawToCanvas(img, preset.maxDim, MAX_UPSCALE);
+    // Pixel-space radii in the presets are quoted at a 400px reference.
+    const resScale = Math.max(w, h) / 400;
+    const px = (base) => Math.max(1, Math.round(base * resScale));
     let fg;
     if (!removeBackground) {
       fg = new Uint8Array(w * h).fill(1);
@@ -1075,21 +1207,21 @@ export const ImagePipeline = (function () {
 
     if (usedCutout || removeBackground) {
       // Thin stroke centerlines (not luminance isolines).
-      const score = strokeScore(stretched, w, h, fg, preset.inkBlur);
-      const highP = preset.strokeHighP != null ? preset.strokeHighP : 0.84;
-      const lowP = preset.strokeLowP != null ? preset.strokeLowP : 0.66;
-      let binary = hysteresisMask(score, fg, w, h, highP, lowP);
-      // Close small breaks in the ink, then open speckles.
-      binary = morph(binary, w, h, 1, 'max');
-      binary = morph(binary, w, h, 1, 'max');
-      binary = morph(binary, w, h, 1, 'min');
-      binary = morph(binary, w, h, 1, 'min');
-      const minArea = Math.max(8, Math.floor(w * h * (preset.minComponentFactor || 0.00012)));
+      const { score, p99 } = strokeScore(stretched, w, h, fg, px(preset.inkBlur), resScale);
+      const { hi, lo } = inkThresholds(p99, preset.strokeHiFrac, preset.strokeLoFrac);
+      // No morphological closing here: with a 3x3 kernel it bridges any gap up
+      // to 4px, which on line art fuses neighbouring strokes into a solid mass.
+      // Thinning that mass then traces the gaps between strokes instead of the
+      // strokes, which is what turned drawings into a stained-glass mesh.
+      // Hysteresis already yields connected ink; bridgeSkeletonGaps closes the
+      // rest without thickening anything.
+      let binary = hysteresisMask(score, fg, w, h, hi, lo);
+      const minArea = Math.max(8, Math.floor(w * h * (preset.minComponentFactor || 0.00004)));
       binary = filterSmallComponents(binary, w, h, minArea);
 
       report('Thinning strokes…');
       let thin = zhangSuenThin(binary, w, h);
-      thin = bridgeSkeletonGaps(thin, w, h, preset.bridgeDist || 6);
+      thin = bridgeSkeletonGaps(thin, w, h, px(preset.bridgeDist));
       polylines = polylines.concat(traceSkeleton(thin, w, h));
 
       if (preset.includeSilhouette !== false) {
@@ -1097,11 +1229,11 @@ export const ImagePipeline = (function () {
         polylines = polylines.concat(traceSkeleton(rim, w, h));
       }
 
-      polylines = mergeNearbyPolylines(polylines, preset.mergeDist || 4.5);
+      polylines = mergeNearbyPolylines(polylines, px(preset.mergeDist));
     } else {
       // No BG removal: soft luminance isolines over the whole image.
       report('Tracing contours…');
-      const soft = boxBlur(stretched, w, h, preset.structBlur + 1);
+      const soft = boxBlur(stretched, w, h, px(preset.structBlur) + 1);
       const levels = (preset.internalLevels && preset.internalLevels.length)
         ? preset.internalLevels
         : [0.4, 0.6];
@@ -1112,9 +1244,11 @@ export const ImagePipeline = (function () {
     }
 
     report('Simplifying paths…');
+    const smoothSigma = preset.smoothSigma * resScale;
+    polylines = polylines.map((poly) => smoothPolyline(poly, smoothSigma));
     const { selected, totalPts } = selectPolylines(
       polylines,
-      preset,
+      { ...preset, epsilon: preset.epsilon * resScale },
       fg,
       w,
       h,
